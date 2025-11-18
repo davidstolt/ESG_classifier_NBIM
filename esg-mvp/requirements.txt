@@ -1,0 +1,20 @@
+
+You need to install these packages: 
+
+streamlit
+pymupdf
+pandas
+pydantic
+tiktoken
+aiohttp
+
+
+# To check that all packages is installed, RUN the following code in zsh terminal:
+
+#python3 -c "import importlib.util; pkgs=['streamlit','pymupdf','pandas','pydantic','tiktoken','aiohttp']; [print(f'{p}: INSTALLED') if importlib.util.find_spec(p) else print(f'{p}: NOT INSTALLED') for p in pkgs]"
+
+# then run: python3 -m streamlit run app5.py --server.port 3000 
+# or python3 -m streamlit run app5.py
+
+
+
