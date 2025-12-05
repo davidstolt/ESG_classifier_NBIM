@@ -27,23 +27,21 @@ except Exception:
     from pydantic import validator as _field_validator      
 
 #  Credentials from NHH 
-API_KEY = "-"
-API_URL = "-"
-MODEL_NAME = "-"
+API_KEY = "x"
+API_URL = "x"
+MODEL_NAME = "gpt-5-mini"
 
 # Package to help count tokens, check so it's installed, see "requirements.txt". 
 import tiktoken
 TOK = tiktoken.get_encoding("cl100k_base")
 
-
 # Config parameters for the model
 MAX_CONTEXT_TOKENS = 128_000
 CHUNK_TARGET_TOKENS = 5_000  # See our report 
 CHUNK_OVERLAP_TOKENS = 300  # Only used when a single paragraph is larger than the target size.
-REQUEST_TIMEOUT_SEC = 60
+REQUEST_TIMEOUT_SEC = 120
 MAX_CONCURRENT_REQUESTS = 10  # Parallel execution limit, to avoid overwhelming the API
 LOW_TEXT_THRESHOLD = 2_000  # warn if PDF has little selectable text so its not a scanned document
-
 
 # Streamlit UI, to make the report uploading easier/nicer 
 st.set_page_config(page_title="GPFG-Compliant ESG Classifier", layout="centered")
@@ -51,6 +49,7 @@ st.title("GPFG-Compliant ESG Classifier")
 st.caption("Aligned with Guidelines §3-4 (2022)")
 files = st.file_uploader("Upload PDF annual reports", type=["pdf"], accept_multiple_files=True)
 run_btn = st.button("Run classification")
+
 
 
 # The Pydantic model, which make sure the data structured and formatted + data normalization
@@ -64,6 +63,8 @@ class ESGResult(BaseModel):
     forward_looking_assessment: str = ""
     coal_transition_timeline: str = ""
     confidence_score: float = 0.0  # 0–100 confidence in final classification
+    flagged_lean: str = ""         # "Approved", "Excluded", or "Neutral" - mainly for "Flagged" cases
+    flagged_reasoning: str = ""    # Short explanation for Flagged cases
 
     @_field_validator('classification')
     def validate_classification(cls, v):
@@ -91,9 +92,12 @@ class ESGResult(BaseModel):
             return 100.0
         return v
 
+
+
 # Count tokens using tiktoken (make sure it's installed)
 def count_tokens(text: str) -> int:
     return len(TOK.encode(text))
+
 
 # Convert PDF file into clean text + remove potential weird formatting (one string for the whole document).
 def pdf_bytes_to_text(file_bytes: bytes) -> str:
@@ -104,6 +108,7 @@ def pdf_bytes_to_text(file_bytes: bytes) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def smart_chunk(text: str, target: int, overlap: int):
     """
@@ -143,8 +148,6 @@ def smart_chunk(text: str, target: int, overlap: int):
             if current_chunk:
                 chunks.append('\n\n'.join(current_chunk))
             current_chunk, current_tokens = [para], para_tokens
-
-        # Otherwise, just add paragraph to current chunk
             continue
         else:
             current_chunk.append(para)
@@ -156,14 +159,17 @@ def smart_chunk(text: str, target: int, overlap: int):
 
     return chunks or [text]
 
+
 # Normalize formatting from the LLM 
 def parse_first_json(text: str, default=None):
-    """Extract the first valid JSON object from a model response (handles ```/```json fences)."""
+    """Extract the first valid JSON object from a model response (handles ```json fences)."""
     if not text:
         return default
     s = text.strip()
-    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
-    s = re.sub(r'\s*```\s*$', '', s)
+    # Strip a leading ``` or ```json fence, if present
+    s = re.sub(r'^\s*```(?:json)?', '', s, flags=re.IGNORECASE)
+    # Strip a trailing ``` fence, if present
+    s = re.sub(r'```?\s*$', '', s)
     decoder = json.JSONDecoder()
     for idx, ch in enumerate(s):
         if ch in '{[':
@@ -173,7 +179,7 @@ def parse_first_json(text: str, default=None):
             except json.JSONDecodeError:
                 continue
     return default
- 
+
 # It helps avoid repeated signals before we run the REDUCE step.
 def deduplicate_signals(signals):
     """Keep unique signals by first 100 chars of normalized evidence."""
@@ -191,9 +197,11 @@ def deduplicate_signals(signals):
             unique.append(s)
     return unique
 
+
 # Custom error message, so we might know what went wrong if the LLM fails. 
 class RetryableHTTPError(Exception):
     pass
+
 
 def _retry_after_seconds(resp: aiohttp.ClientResponse):
     """Parse the Retry-After header from an aiohttp response."""
@@ -220,6 +228,7 @@ def _retry_after_seconds(resp: aiohttp.ClientResponse):
         dt = dt.replace(tzinfo=timezone.utc)
 
     return max(0, (dt - datetime.now(timezone.utc)).total_seconds())
+
 
 
 # Send our requests to the LLM, with retries if the server is busy (a common approach)
@@ -262,6 +271,7 @@ async def llm_chat_async(messages, model, url, key, session, timeout=REQUEST_TIM
     
     raise RetryableHTTPError(f"Failed after {max_retries} attempts")
 
+
 # The core of our model: This sends ONE chunk of text to the LLM and asks it to extract ESG "signals". Use the prompt in "prompts.py". 
 # If none found it still sends a empty list so the chain don't break.  
 async def map_extract_signals_async(chunk, key, model, url, session):
@@ -284,6 +294,7 @@ async def map_extract_signals_async(chunk, key, model, url, session):
     except Exception as e:
         st.warning(f"MAP extraction failed: {str(e)[:100]}")
         return {"signals": []}
+
 
 # See the omment in the code
 async def process_chunks_parallel(chunks, key, model, url, max_concurrent, session, progress_callback=None):
@@ -311,13 +322,16 @@ async def process_chunks_parallel(chunks, key, model, url, max_concurrent, sessi
     return deduplicate_signals(all_signals)
 
 
+
 # If the company name is not found, use the file name. 
 def robust_name(v, fallback):
     return v if v and v.strip() not in {"", "Unknown", "N/A"} else fallback
 
+
 # Same idea but here's it says Unknown Industry instead. 
 def robust_industry(v):
     return v if v and v.strip().lower() not in {"", "unknown", "n/a"} else "Unknown Industry"
+
 
 # The combined signals is send to the second AI prompt to evaluate the final ESG classification. 
 async def reduce_classify_async(signals, fallback_company, doc_header, key, model, url, session):
@@ -333,13 +347,15 @@ async def reduce_classify_async(signals, fallback_company, doc_header, key, mode
         "key_evidence": [],
         "forward_looking_assessment": "",
         "coal_transition_timeline": "",
-        "confidence_score": 0.0
+        "confidence_score": 0.0,
+        "flagged_lean": "",  # NEW field for direction if "Flagged"
+        "flagged_reasoning": ""
     }
     try:
         raw = await llm_chat_async(msgs, model, url, key, session)
         out = parse_first_json(raw, default=default) or default
 
-        # Agian, if any content filter tripped in MAP, that the LLM sometimes dont want to process --> force flagg it 
+        # IF any content filter tripped in MAP, that the LLM sometimes dont want to process --> force flagg it 
         if any((isinstance(s, dict) and s.get("criterion") == "content_filter_triggered") for s in signals):
             out["classification"] = "Flagged"
             out["reasoning"] = (out.get("reasoning", "") +
@@ -355,6 +371,7 @@ async def reduce_classify_async(signals, fallback_company, doc_header, key, mode
         default["reasoning"] = f"REDUCE error: {str(e)[:150]}"
         default.setdefault("confidence_score", 0.0)
         return default
+
 
 # See code comment again 
 async def process_single_file_async(file_name, file_data, key, model, url, max_concurrent, session, status_callback=None):
@@ -401,7 +418,8 @@ async def process_single_file_async(file_name, file_data, key, model, url, max_c
                 "key_evidence": [],
                 "forward_looking_assessment": "",
                 "coal_transition_timeline": "",
-                "confidence_score": 0.0
+                "confidence_score": 0.0,
+                "flagged_lean": ""
             }
 
         return {
@@ -416,8 +434,11 @@ async def process_single_file_async(file_name, file_data, key, model, url, max_c
             "coal_transition": final.get("coal_transition_timeline", ""),
             "chunks_processed": len(chunks),
             "signals_found": len(signals),
-            "confidence_score": final.get("confidence_score", 0.0)
+            "confidence_score": final.get("confidence_score", 0.0),
+            "flagged_lean": final.get("flagged_lean", ""),
+            "flagged_reasoning": final.get("flagged_reasoning", "")
         }
+
 
     except Exception as e:
         return {
@@ -432,8 +453,10 @@ async def process_single_file_async(file_name, file_data, key, model, url, max_c
             "coal_transition": "",
             "chunks_processed": 0,
             "signals_found": 0,
-            "confidence_score": 0.0
+            "confidence_score": 0.0,
+            "flagged_lean": ""
         }
+
 
 
 # We use the ClientSession to keep all API calls within the same session (also a common practice for efficiency). 
@@ -473,11 +496,13 @@ async def process_all_files_async(files, key, model, url, max_concurrent, progre
                     "coal_transition": "",
                     "chunks_processed": 0,
                     "signals_found": 0,
-                    "confidence_score": 0.0
+                    "confidence_score": 0.0,
+                    "flagged_lean": ""
                 })
             progress_bar.progress((i + 1) / len(file_data_list))  # Update the progress bar after each file processed
     
     return processed_results  # List of the results
+
 
 
 # More Streamlit UI
@@ -512,3 +537,5 @@ if run_btn:
     )
 
     # Allow the user to download the results as a CSV file. DONE!!!
+
+
